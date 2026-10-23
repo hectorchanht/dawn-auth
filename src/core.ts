@@ -16,8 +16,16 @@ export const SESSION_MAX_AGE_SECONDS = 30 * 24 * 3600;
 /** The one shape every token (magic + session) must have before it is hashed or looked up. */
 export const TOKEN_RE = /^[0-9a-f]{64}$/;
 
-/** The 6-digit sign-in code shape. */
+/** The default 6-digit sign-in code shape (see `codeRe()` for other lengths). */
 export const CODE_RE = /^[0-9]{6}$/;
+
+/**
+ * Sign-in code shape for a configured length: `codeRe(cfg.codeLength)`.
+ * The length itself is validated by `defineAuth()` (4–9, crypto-safe).
+ */
+export function codeRe(length: number): RegExp {
+	return new RegExp(`^[0-9]{${length}}$`);
+}
 
 /** A code dies after this many wrong guesses (per code_hash row, in the store). */
 export const MAX_CODE_ATTEMPTS = 5;
@@ -50,17 +58,20 @@ export async function sha256hexN(s: string, n: number): Promise<string> {
 }
 
 /**
- * Crypto-random 6-digit code (100000–999999), rejection-sampled off a full uint32 —
- * no modulo bias (900000 divides 2^32 with a remainder, so the tail is re-drawn).
+ * Crypto-random numeric code of `length` digits (default 6 ⇒ 100000–999999),
+ * rejection-sampled off a full uint32 — no modulo bias (the range divides 2^32 with
+ * a remainder, so the tail is re-drawn). Lengths 4–9 stay inside uint32; longer is
+ * rejected by `defineAuth()` so the bias math always holds.
  */
-export function randomCode(): string {
-	const b = new Uint32Array(1);
-	const range = 900000;
+export function randomCode(length = 6): string {
+	const min = 10 ** (length - 1);
+	const range = 9 * min;
 	const limit = 4294967296 - (4294967296 % range);
+	const b = new Uint32Array(1);
 	do {
 		crypto.getRandomValues(b);
 	} while ((b[0] as number) >= limit);
-	return String(100000 + ((b[0] as number) % range));
+	return String(min + ((b[0] as number) % range));
 }
 
 /**
@@ -120,21 +131,58 @@ export function getAuthToken(request: Request, cookieName: string): string | nul
 	return null;
 }
 
-/** `Set-Cookie` value establishing the session (30-day, httpOnly, Secure, SameSite=Lax). */
-export function buildSessionCookie(token: string, cookieName: string, maxAgeSeconds = SESSION_MAX_AGE_SECONDS): string {
-	return [
-		`${cookieName}=${encodeURIComponent(token)}`,
-		'Path=/',
-		'HttpOnly',
-		'Secure',
-		'SameSite=Lax',
-		`Max-Age=${maxAgeSeconds}`
-	].join('; ');
+/**
+ * Session cookie attributes — every one is user-configurable via
+ * `defineAuth({ cookie: { ... } })`. Defaults keep the secure posture:
+ * httpOnly, Secure, SameSite=Lax, Path=/.
+ */
+export interface SessionCookieAttrs {
+	/** 'Lax' | 'Strict' | 'None'. Default 'Lax'. */
+	sameSite?: 'Lax' | 'Strict' | 'None';
+	/** Default true. Set false ONLY for plain-http local dev (never in prod). */
+	secure?: boolean;
+	/** Default '/'. */
+	path?: string;
+	/** Optional, e.g. '.app.lol' for subdomain SSO. */
+	domain?: string;
+	/** Default true. */
+	httpOnly?: boolean;
 }
 
-/** `Set-Cookie` value clearing the session (logout). */
-export function clearSessionCookie(cookieName: string): string {
-	return `${cookieName}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
+/** Resolved cookie attributes — every field concrete except the optional domain. */
+export interface ResolvedSessionCookieAttrs {
+	sameSite: 'Lax' | 'Strict' | 'None';
+	secure: boolean;
+	path: string;
+	domain?: string;
+	httpOnly: boolean;
+}
+
+function cookieAttrParts(attrs: SessionCookieAttrs): string[] {
+	const parts: string[] = [`Path=${attrs.path ?? '/'}`];
+	if (attrs.httpOnly ?? true) parts.push('HttpOnly');
+	if (attrs.secure ?? true) parts.push('Secure');
+	parts.push(`SameSite=${attrs.sameSite ?? 'Lax'}`);
+	if (attrs.domain) parts.push(`Domain=${attrs.domain}`);
+	return parts;
+}
+
+/** `Set-Cookie` value establishing the session (default 30-day, httpOnly, Secure, SameSite=Lax). */
+export function buildSessionCookie(
+	token: string,
+	cookieName: string,
+	maxAgeSeconds = SESSION_MAX_AGE_SECONDS,
+	attrs: SessionCookieAttrs = {}
+): string {
+	return [`${cookieName}=${encodeURIComponent(token)}`, ...cookieAttrParts(attrs), `Max-Age=${maxAgeSeconds}`].join(
+		'; '
+	);
+}
+
+/** `Set-Cookie` value clearing the session (logout) — mirrors the same attrs so the
+ *  clear actually overwrites the set cookie (Path/Domain must match). */
+export function clearSessionCookie(cookieName: string, attrs: SessionCookieAttrs = {}): string {
+	return [`${cookieName}=`, ...cookieAttrParts(attrs), 'Max-Age=0'].join('; ');
 }
 
 /** Best-effort client IP for rate-limit keys. Cloudflare sets CF-Connecting-IP on every

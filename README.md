@@ -140,6 +140,62 @@ await authClient.logout();
 | `client` | `DawnAuthClient` — browser session client, web + native bearer seam |
 | `messages` | default English UI copy for the result unions |
 
+## Configuration (v0.2.0 — max-config principle)
+
+`defineAuth()` exposes every knob a reasonable app would want; zero-config defaults keep the APP AUTH STANDARD semantics (magic link + code, mutual burn, single-use, 15-min TTL, 5 attempts):
+
+```ts
+defineAuth({
+  appName: 'Clipbin',
+  domain: 'clipbin.lol',
+  from: 'Clipbin <login@clipbin.lol>', // REQUIRED (own-domain rule)
+  resendApiKey: process.env.RESEND_API_KEY,
+  googleClientId: '….apps.googleusercontent.com',
+
+  // --- code + attempts ---
+  codeLength: 8,          // default 6 (validated 4–9)
+  maxCodeAttempts: 3,     // default 5; email copy ({attempts}) follows automatically
+
+  // --- session cookie attrs (beyond cookieName) ---
+  cookie: {
+    sameSite: 'Strict',   // default 'Lax'
+    secure: true,          // default true
+    path: '/',             // default '/'
+    domain: '.clipbin.lol',// optional — subdomain SSO
+    httpOnly: true,        // default true
+  },
+
+  // --- email copy (placeholders: {app} {code} {email} {domain} {ttl} {attempts}) ---
+  emailCopy: {
+    subject: '你的登入碼 {code}',   // default 'Use code {code} to sign in to {app}'
+    greeting: '你好，',               // + codeIntro / codeLabel / codeNote / linkIntro /
+  },                                   //   ctaLabel / linkNote / footerSent / footerBrand
+  // buildEmail: (p) => ({ subject, html, text }), // full redesign escape hatch
+
+  // --- lifecycle hook (fire-and-forget; a throwing listener never breaks auth) ---
+  onEvent: (e) => {
+    // e.type: 'link.requested' | 'link.failed' | 'link.verified' |
+    //         'code.verified' | 'code.failed' |
+    //         'google.signed-in' | 'google.failed' | 'session.destroyed'
+    analytics.track('auth', e);
+  },
+
+  googleCertsTtlMs: 30 * 60 * 1000, // default 1h
+  // magicLinkTtlMs, sessionTtlMs, magicLinkLimits, verifyCodeLimits, googleLimits,
+  // nativeSchemes, magicPagePath, brandColor, mailer — as before
+});
+```
+
+Client knobs (`new DawnAuthClient({...})`):
+
+| option | default | notes |
+|---|---|---|
+| `codeLength` | `6` | must match the server's `codeLength` (client-side shape check) |
+| `requestTimeoutMs` | `15000` | timeout for sign-in POSTs |
+| `probeTimeoutMs` | `8000` | timeout for the post-failure differential probe |
+
+New exports: `codeRe`, `SessionCookieAttrs` / `ResolvedSessionCookieAttrs`, `EmailCopy`, `DEFAULT_EMAIL_COPY`, `resolveEmailCopy`, `ttlText`, `AuthEvent`.
+
 ## Security notes
 
 - Raw tokens **never touch the database** — only `SHA-256('magic:'|… 'code:'|'session:'+token)` are stored. A DB leak hands out no usable credential.

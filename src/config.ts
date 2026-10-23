@@ -1,6 +1,10 @@
 // @dawn-studio/auth — app configuration. Every OpenMusic-specific value is a field
 // here; nothing about one app's identity is baked into the lib.
 
+import type { ResolvedSessionCookieAttrs, SessionCookieAttrs } from './core.js';
+import type { EmailCopy, SignInEmail, SignInEmailParams } from './email.js';
+import type { AuthEvent } from './service.js';
+
 /** Rate-limit knobs for one guarded operation. */
 export interface RateLimitConfig {
 	/** Max hits per key per window (default per operation — see DEFAULTS below). */
@@ -59,6 +63,43 @@ export interface AuthConfig {
 	magicLinkTtlMs?: number;
 	/** Session lifetime in ms. Default 30 days. */
 	sessionTtlMs?: number;
+	/**
+	 * Sign-in code length in digits. Default 6. Validated 4–9 at boot (the
+	 * rejection-sampling math in randomCode needs the range inside uint32).
+	 */
+	codeLength?: number;
+	/**
+	 * A code dies after this many wrong guesses (per code_hash row, in the store).
+	 * Default 5 (matches the APP AUTH STANDARD; the email copy reflects it).
+	 */
+	maxCodeAttempts?: number;
+	/**
+	 * Session cookie attributes beyond the name: sameSite / secure / path /
+	 * domain / httpOnly. Defaults: HttpOnly, Secure, SameSite=Lax, Path=/.
+	 */
+	cookie?: SessionCookieAttrs;
+	/**
+	 * Email copy overrides (subject + body strings, {app}/{code}/{email}/{domain}/
+	 * {ttl}/{attempts} placeholders). Only the fields you set are replaced; the
+	 * rest keep the house design. {ttl} and {attempts} are computed from
+	 * magicLinkTtlMs / maxCodeAttempts automatically.
+	 */
+	emailCopy?: EmailCopy;
+	/**
+	 * Full email-builder escape hatch: replaces buildSignInEmail entirely.
+	 * Receives the same params (plus the resolved copy); returns { subject, html, text }.
+	 */
+	buildEmail?: (p: SignInEmailParams) => SignInEmail;
+	/**
+	 * Lifecycle hook: link.requested / link.failed / link.verified / code.verified /
+	 * code.failed / google.signed-in / google.failed / session.destroyed.
+	 * Fire-and-forget — throwing inside the hook never breaks auth.
+	 */
+	onEvent?: (event: AuthEvent) => void;
+	/**
+	 * How long fetched Google certs are trusted (module-scope cache). Default 1 hour.
+	 */
+	googleCertsTtlMs?: number;
 	/** requestMagicLink limits. Defaults: 3/email + 10/IP per 10 min. */
 	magicLinkLimits?: MagicLinkRateLimits;
 	/** verifyCode limits. Defaults: 10/email + 50/IP per 10 min. */
@@ -88,11 +129,18 @@ export interface ResolvedAuthConfig {
 	resendApiKey?: string;
 	googleClientId?: string;
 	cookieName: string;
+	cookie: ResolvedSessionCookieAttrs;
 	nativeSchemes: string[];
 	magicPagePath: string;
 	brandColor: string;
 	magicLinkTtlMs: number;
 	sessionTtlMs: number;
+	codeLength: number;
+	maxCodeAttempts: number;
+	emailCopy?: EmailCopy;
+	buildEmail?: (p: SignInEmailParams) => SignInEmail;
+	onEvent?: (event: AuthEvent) => void;
+	googleCertsTtlMs: number;
 	magicLinkLimits: MagicLinkRateLimits;
 	verifyCodeLimits: VerifyCodeRateLimits;
 	googleLimits: GoogleRateLimits;
@@ -110,6 +158,24 @@ export function defineAuth(cfg: AuthConfig): ResolvedAuthConfig {
 		);
 	}
 	const slug = cfg.appName.toLowerCase().replace(/[^a-z0-9]+/g, '');
+	const codeLength = cfg.codeLength ?? 6;
+	if (!Number.isInteger(codeLength) || codeLength < 4 || codeLength > 9) {
+		throw new Error(
+			`[@dawn-studio/auth] config.codeLength must be an integer 4–9 (got ${cfg.codeLength})`
+		);
+	}
+	const maxCodeAttempts = cfg.maxCodeAttempts ?? 5;
+	if (!Number.isInteger(maxCodeAttempts) || maxCodeAttempts < 1) {
+		throw new Error(
+			`[@dawn-studio/auth] config.maxCodeAttempts must be an integer >= 1 (got ${cfg.maxCodeAttempts})`
+		);
+	}
+	const sameSite = cfg.cookie?.sameSite ?? 'Lax';
+	if (sameSite !== 'Lax' && sameSite !== 'Strict' && sameSite !== 'None') {
+		throw new Error(
+			`[@dawn-studio/auth] config.cookie.sameSite must be 'Lax' | 'Strict' | 'None' (got ${sameSite})`
+		);
+	}
 	return {
 		appName: cfg.appName,
 		domain: cfg.domain,
@@ -117,6 +183,19 @@ export function defineAuth(cfg: AuthConfig): ResolvedAuthConfig {
 		resendApiKey: cfg.resendApiKey,
 		googleClientId: cfg.googleClientId,
 		cookieName: cfg.cookieName ?? `${slug}_session`,
+		cookie: {
+			sameSite,
+			secure: cfg.cookie?.secure ?? true,
+			path: cfg.cookie?.path ?? '/',
+			domain: cfg.cookie?.domain,
+			httpOnly: cfg.cookie?.httpOnly ?? true
+		},
+		codeLength,
+		maxCodeAttempts,
+		emailCopy: cfg.emailCopy,
+		buildEmail: cfg.buildEmail,
+		onEvent: cfg.onEvent,
+		googleCertsTtlMs: cfg.googleCertsTtlMs ?? 60 * 60 * 1000,
 		nativeSchemes: cfg.nativeSchemes ?? [],
 		magicPagePath: cfg.magicPagePath ?? '/auth/magic',
 		brandColor: cfg.brandColor ?? '#00c2b8',

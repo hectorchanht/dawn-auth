@@ -12,6 +12,7 @@
 
 import {
 	TOKEN_RE,
+	codeRe,
 	diagLine,
 	isValidEmail,
 	type AccountUser
@@ -58,6 +59,12 @@ export interface DawnAuthClientOptions {
 	};
 	/** Key for the persisted native bearer. Default '<slug>:auth-token:v1'. */
 	tokenStorageKey?: string;
+	/** Sign-in code length in digits — must match the server's `codeLength`. Default 6. */
+	codeLength?: number;
+	/** Timeout for sign-in POSTs. Default 15000ms. */
+	requestTimeoutMs?: number;
+	/** Timeout for the post-failure differential probe. Default 8000ms. */
+	probeTimeoutMs?: number;
 	/** Optional Google sign-out hook (native): release the Play-Services identity so
 	 *  the next "Sign in with Google" re-prompts the account chooser. */
 	onNativeGoogleSignOut?: () => Promise<void>;
@@ -80,7 +87,9 @@ function defaultStorage(): DawnAuthClientOptions['storage'] {
 }
 
 export class DawnAuthClient {
-	private opts: Required<Pick<DawnAuthClientOptions, 'baseUrl' | 'fetchImpl' | 'tokenStorageKey'>> &
+	private opts: Required<
+		Pick<DawnAuthClientOptions, 'baseUrl' | 'fetchImpl' | 'tokenStorageKey' | 'codeLength' | 'requestTimeoutMs' | 'probeTimeoutMs'>
+	> &
 		Pick<DawnAuthClientOptions, 'storage' | 'onNativeGoogleSignOut'> & { isNative: () => boolean };
 	private listeners = new Set<(snap: AuthSnapshot) => void>();
 	private bearer: string | null = null;
@@ -96,6 +105,9 @@ export class DawnAuthClient {
 			baseUrl: opts.baseUrl ?? '',
 			fetchImpl: opts.fetchImpl ?? fetch.bind(globalThis),
 			tokenStorageKey: opts.tokenStorageKey ?? 'dawn:auth-token:v1',
+			codeLength: opts.codeLength ?? 6,
+			requestTimeoutMs: opts.requestTimeoutMs ?? 15_000,
+			probeTimeoutMs: opts.probeTimeoutMs ?? 8_000,
 			isNative: typeof isNative === 'function' ? isNative : () => isNative,
 			storage: opts.storage ?? defaultStorage(),
 			onNativeGoogleSignOut: opts.onNativeGoogleSignOut
@@ -178,7 +190,7 @@ export class DawnAuthClient {
 				const res = await this.authedFetch('/api/auth/magic-link', {
 					method: 'POST',
 					body: JSON.stringify({ email: clean, ...(opts?.scheme ? { scheme: opts.scheme } : {}) }),
-					signal: AbortSignal.timeout(15_000)
+					signal: AbortSignal.timeout(this.opts.requestTimeoutMs)
 				});
 				if (res.ok) return 'ok';
 				const err = ((await res.json().catch(() => null)) as { err?: string } | null)?.err;
@@ -209,7 +221,9 @@ export class DawnAuthClient {
 	private async probeDiag(): Promise<string> {
 		const t0 = Date.now();
 		try {
-			const res = await this.authedFetch('/api/auth/session', { signal: AbortSignal.timeout(8_000) });
+			const res = await this.authedFetch('/api/auth/session', {
+				signal: AbortSignal.timeout(this.opts.probeTimeoutMs)
+			});
 			return ` || probe: HTTP ${res.status} @${Date.now() - t0}ms`;
 		} catch (e) {
 			const name = e instanceof Error ? e.name : 'Unknown';
@@ -268,10 +282,10 @@ export class DawnAuthClient {
 		}
 	}
 
-	/** Sign-in step 2b: verify the 6-digit code from the sign-in email (native path). */
+	/** Sign-in step 2b: verify the numeric code from the sign-in email (native path). */
 	async verifyCode(email: string, code: string): Promise<ClientVerifyCodeResult> {
 		const cleanEmail = email.trim().toLowerCase();
-		if (!isValidEmail(cleanEmail) || !/^[0-9]{6}$/.test(code.trim())) return 'invalid';
+		if (!isValidEmail(cleanEmail) || !codeRe(this.opts.codeLength).test(code.trim())) return 'invalid';
 		try {
 			const res = await this.authedFetch('/api/auth/verify-code', {
 				method: 'POST',

@@ -48,9 +48,9 @@ function base64UrlDecode(s: string): Uint8Array<ArrayBuffer> {
 	return out;
 }
 
-async function getGoogleCerts(fetchImpl: typeof fetch): Promise<GoogleJwk[]> {
+async function getGoogleCerts(fetchImpl: typeof fetch, ttlMs: number): Promise<GoogleJwk[]> {
 	const now = Date.now();
-	if (cachedCerts && now - cachedCerts.fetchedAt < GOOGLE_CERTS_TTL_MS) return cachedCerts.keys;
+	if (cachedCerts && now - cachedCerts.fetchedAt < ttlMs) return cachedCerts.keys;
 	const res = await fetchImpl(GOOGLE_CERTS_URL);
 	if (!res.ok) throw new Error(`certs fetch failed: ${res.status}`);
 	const jwks = (await res.json()) as GoogleJwks;
@@ -69,6 +69,8 @@ export interface VerifyGoogleIdTokenOptions {
 	fetchCerts?: () => Promise<GoogleJwks>;
 	/** Pins the clock for expiry tests. */
 	now?: number;
+	/** How long fetched certs are trusted. Default 1 hour. */
+	certsTtlMs?: number;
 }
 
 /**
@@ -105,7 +107,9 @@ export async function verifyGoogleIdToken(
 
 	let keys: GoogleJwk[];
 	try {
-		keys = opts?.fetchCerts ? (await opts.fetchCerts()).keys : await getGoogleCerts(fetch);
+		keys = opts?.fetchCerts
+			? (await opts.fetchCerts()).keys
+			: await getGoogleCerts(fetch, opts?.certsTtlMs ?? GOOGLE_CERTS_TTL_MS);
 	} catch {
 		return { ok: false, reason: 'certs-unavailable' };
 	}

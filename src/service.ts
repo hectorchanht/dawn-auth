@@ -15,12 +15,11 @@
 
 import type { ResolvedAuthConfig } from './config.js';
 import {
-	CODE_RE,
-	MAX_CODE_ATTEMPTS,
 	TOKEN_RE,
 	buildSessionCookie,
 	clearSessionCookie,
 	clientIp,
+	codeRe,
 	getAuthToken,
 	isAllowedScheme,
 	isValidEmail,
@@ -30,7 +29,7 @@ import {
 	timingSafeEqual,
 	type AccountUser
 } from './core.js';
-import { buildSignInEmail } from './email.js';
+import { buildSignInEmail, type SignInEmailParams } from './email.js';
 import { verifyGoogleIdToken, type GoogleJwks } from './google.js';
 import { rateLimit, type AuthStore } from './store.js';
 
@@ -72,6 +71,28 @@ export type VerifyCodeServiceResult =
 export type GoogleSignInResult =
 	| ({ ok: true } & SessionIssued)
 	| { ok: false; reason: 'invalid-token' | 'rate-limited' | 'not-configured' };
+
+/**
+ * Lifecycle events for `cfg.onEvent`. Fire-and-forget: a throwing listener never
+ * breaks auth. `at` is Date.now() (ms).
+ */
+export type AuthEvent =
+	| { type: 'link.requested'; email: string; ip: string; at: number }
+	| { type: 'link.failed'; email: string; ip: string; reason: Exclude<RequestLinkResult, 'ok'>; at: number }
+	| { type: 'link.verified'; email: string; at: number }
+	| { type: 'code.verified'; email: string; at: number }
+	| { type: 'code.failed'; email: string; ip: string; reason: Exclude<VerifyCodeResult, 'ok'>; at: number }
+	| { type: 'google.signed-in'; email: string; ip: string; at: number }
+	| { type: 'google.failed'; ip: string; reason: Exclude<GoogleSignInResult, { ok: true }>['reason']; at: number }
+	| { type: 'session.destroyed'; at: number };
+
+function emit(cfg: ResolvedAuthConfig, event: AuthEvent): void {
+	try {
+		cfg.onEvent?.(event);
+	} catch {
+		/* listener bugs must not break auth */
+	}
+}
 
 /**
  * Issue the app's own session for an email: upsert the user row by email, mint a
@@ -146,27 +167,32 @@ export async function requestMagicLink(
 	input: RequestMagicLinkInput
 ): Promise<RequestLinkResult> {
 	const email = input.email.trim().toLowerCase();
-	if (!isValidEmail(email)) return 'invalid-email';
+	const fail = (reason: Exclude<RequestLinkResult, 'ok'>): RequestLinkResult => {
+		emit(cfg, { type: 'link.failed', email, ip: input.ip, reason, at: Date.now() });
+		return reason;
+	};
+	if (!isValidEmail(email)) return fail('invalid-email');
 	if (input.scheme !== undefined && !isAllowedScheme(input.scheme, cfg.nativeSchemes)) {
-		return 'invalid-scheme';
+		return fail('invalid-scheme');
 	}
 
 	const [okEmail, okIp] = await Promise.all([
 		rateLimit(store, `ml:email:${email}`, cfg.magicLinkLimits.perEmail.max, cfg.magicLinkLimits.perEmail.windowMs),
 		rateLimit(store, `ml:ip:${input.ip}`, cfg.magicLinkLimits.perIp.max, cfg.magicLinkLimits.perIp.windowMs)
 	]);
-	if (!okEmail || !okIp) return 'rate-limited';
+	if (!okEmail || !okIp) return fail('rate-limited');
 
 	// Fail CLOSED on a missing key, BEFORE minting anything — a misconfigured deploy
 	// never leaves orphan token rows.
-	if (!cfg.resendApiKey) return 'not-configured';
+	if (!cfg.resendApiKey) return fail('not-configured');
 
 	const token = randomToken(32);
 	const tokenHash = await sha256hex('magic:' + token);
-	// The SECOND credential for this intent: a 6-digit code for the native path (typed
-	// into the app, no browser). Stored as hex(SHA-256('code:'+code)); the raw code only
-	// ever exists in the email. Either credential burns the intent.
-	const code = randomCode();
+	// The SECOND credential for this intent: a numeric code for the native path (typed
+	// into the app, no browser; length = cfg.codeLength, default 6). Stored as
+	// hex(SHA-256('code:'+code)); the raw code only ever exists in the email. Either
+	// credential burns the intent.
+	const code = randomCode(cfg.codeLength);
 	const codeHash = await sha256hex('code:' + code);
 	await store.insertMagicToken({
 		token_hash: tokenHash,
@@ -178,23 +204,25 @@ export async function requestMagicLink(
 
 	const link = `${input.origin}${cfg.magicPagePath}?token=${token}`;
 	const mailer = cfg.mailer ?? ((m) => sendViaResend(cfg.resendApiKey as string, m));
-	const sent = await mailer({
-		from: cfg.from,
-		to: email,
-		...buildSignInEmail({
-			appName: cfg.appName,
-			domain: cfg.domain,
-			brandColor: cfg.brandColor,
-			link,
-			code,
-			toEmail: email
-		})
-	});
+	const buildEmail = cfg.buildEmail ?? buildSignInEmail;
+	const emailParams: SignInEmailParams = {
+		appName: cfg.appName,
+		domain: cfg.domain,
+		brandColor: cfg.brandColor,
+		link,
+		code,
+		toEmail: email,
+		copy: cfg.emailCopy,
+		ttlMs: cfg.magicLinkTtlMs,
+		maxAttempts: cfg.maxCodeAttempts
+	};
+	const sent = await mailer({ from: cfg.from, to: email, ...buildEmail(emailParams) });
 	if (!sent) {
 		// The email never left — the token must not stay redeemable.
 		await store.deleteMagicToken(tokenHash);
-		return 'send-failed';
+		return fail('send-failed');
 	}
+	emit(cfg, { type: 'link.requested', email, ip: input.ip, at: Date.now() });
 	return 'ok';
 }
 
@@ -216,6 +244,7 @@ export async function verifyMagicToken(
 	}
 	await store.burnMagicToken(hash);
 	const { user, token: sessionToken } = await issueSessionForEmail(store, row.email, cfg.sessionTtlMs);
+	emit(cfg, { type: 'link.verified', email: row.email, at: Date.now() });
 	return { ok: true, user, sessionToken, scheme: row.scheme };
 }
 
@@ -237,34 +266,39 @@ export async function verifyCode(
 ): Promise<VerifyCodeServiceResult> {
 	const email = input.email.trim().toLowerCase();
 	const code = input.code.trim();
-	if (!isValidEmail(email) || !CODE_RE.test(code)) {
-		return { ok: false, result: 'invalid' };
+	const fail = (result: Exclude<VerifyCodeResult, 'ok'>): VerifyCodeServiceResult => {
+		emit(cfg, { type: 'code.failed', email, ip: input.ip, reason: result, at: Date.now() });
+		return { ok: false, result };
+	};
+	if (!isValidEmail(email) || !codeRe(cfg.codeLength).test(code)) {
+		return fail('invalid');
 	}
 
 	// Guess-rate limit BEFORE touching the token row (defense in depth over the
-	// per-code 5-attempt rule).
+	// per-code attempt rule).
 	const [okEmail, okIp] = await Promise.all([
 		rateLimit(store, `vc:email:${email}`, cfg.verifyCodeLimits.perEmail.max, cfg.verifyCodeLimits.perEmail.windowMs),
 		rateLimit(store, `vc:ip:${input.ip}`, cfg.verifyCodeLimits.perIp.max, cfg.verifyCodeLimits.perIp.windowMs)
 	]);
-	if (!okEmail || !okIp) return { ok: false, result: 'rate-limited' };
+	if (!okEmail || !okIp) return fail('rate-limited');
 
 	// Latest live intent for this email. `used = 1` covers link-burned rows too —
 	// either credential consumes the intent.
 	const row = await store.findLiveMagicTokenByEmail(email, Date.now());
 	// One refusal for unknown / expired / code-less rows — never say which.
-	if (!row || !row.code_hash) return { ok: false, result: 'invalid-code' };
-	if (row.code_attempts >= MAX_CODE_ATTEMPTS) return { ok: false, result: 'too-many-attempts' };
+	if (!row || !row.code_hash) return fail('invalid-code');
+	if (row.code_attempts >= cfg.maxCodeAttempts) return fail('too-many-attempts');
 
 	const guessHash = await sha256hex('code:' + code);
 	if (!timingSafeEqual(guessHash, row.code_hash)) {
 		await store.bumpCodeAttempts(row.token_hash);
-		return { ok: false, result: 'invalid-code' };
+		return fail('invalid-code');
 	}
 
 	// Correct code — burn the intent (the link dies with it) and issue the session.
 	await store.burnMagicToken(row.token_hash);
 	const { user, token: sessionToken } = await issueSessionForEmail(store, email, cfg.sessionTtlMs);
+	emit(cfg, { type: 'code.verified', email, at: Date.now() });
 	return { ok: true, user, sessionToken, scheme: row.scheme };
 }
 
@@ -286,23 +320,28 @@ export async function signInWithGoogle(
 	cfg: ResolvedAuthConfig,
 	input: GoogleSignInInput
 ): Promise<GoogleSignInResult> {
-	if (!cfg.googleClientId) return { ok: false, reason: 'not-configured' };
+	const fail = (reason: Exclude<GoogleSignInResult, { ok: true }>['reason']): GoogleSignInResult => {
+		emit(cfg, { type: 'google.failed', ip: input.ip, reason, at: Date.now() });
+		return { ok: false, reason };
+	};
+	if (!cfg.googleClientId) return fail('not-configured');
 	const idToken = input.idToken;
-	if (!idToken || idToken.length > 8192) return { ok: false, reason: 'invalid-token' };
+	if (!idToken || idToken.length > 8192) return fail('invalid-token');
 
 	// Pre-verification rate limit by IP (the email is only known after verification).
 	// A Google sign-in attempt is cheap for an attacker to mint (no email round-trip).
 	if (!(await rateLimit(store, `google:ip:${input.ip}`, cfg.googleLimits.perIp.max, cfg.googleLimits.perIp.windowMs))) {
-		return { ok: false, reason: 'rate-limited' };
+		return fail('rate-limited');
 	}
 
 	const verified = await verifyGoogleIdToken(idToken, {
 		clientId: cfg.googleClientId,
 		fetchCerts: input.fetchCerts,
-		now: input.now
+		now: input.now,
+		certsTtlMs: cfg.googleCertsTtlMs
 	});
 	// One refusal for every verification failure — never say which (no oracle).
-	if (!verified.ok) return { ok: false, reason: 'invalid-token' };
+	if (!verified.ok) return fail('invalid-token');
 
 	// Post-verification rate limit by email — a verified identity is the stable key.
 	if (
@@ -313,10 +352,11 @@ export async function signInWithGoogle(
 			cfg.googleLimits.perEmail.windowMs
 		))
 	) {
-		return { ok: false, reason: 'rate-limited' };
+		return fail('rate-limited');
 	}
 
 	const { user, token: sessionToken } = await issueSessionForEmail(store, verified.email, cfg.sessionTtlMs);
+	emit(cfg, { type: 'google.signed-in', email: verified.email, ip: input.ip, at: Date.now() });
 	return { ok: true, user, sessionToken, scheme: null };
 }
 
@@ -349,13 +389,14 @@ export async function destroySession(
 	if (token) {
 		await store.deleteSession(await sha256hex('session:' + token));
 	}
-	return { clearCookie: clearSessionCookie(cfg.cookieName) };
+	emit(cfg, { type: 'session.destroyed', at: Date.now() });
+	return { clearCookie: clearSessionCookie(cfg.cookieName, cfg.cookie) };
 }
 
 /** `Set-Cookie` header value establishing a session — the route sets it on verify. */
 export function sessionCookie(sessionToken: string, cfg: ResolvedAuthConfig): string {
 	const maxAge = Math.floor(cfg.sessionTtlMs / 1000);
-	return buildSessionCookie(sessionToken, cfg.cookieName, maxAge);
+	return buildSessionCookie(sessionToken, cfg.cookieName, maxAge, cfg.cookie);
 }
 
 /** Best-effort client IP for rate-limit keys (Cloudflare CF-Connecting-IP, else 'unknown'). */

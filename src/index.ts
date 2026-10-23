@@ -23,6 +23,7 @@ export type {
 export {
 	TOKEN_RE,
 	CODE_RE,
+	codeRe,
 	MAX_CODE_ATTEMPTS,
 	SESSION_MAX_AGE_SECONDS,
 	isAllowedScheme,
@@ -43,7 +44,7 @@ export {
 	parseAuthCallbackUrl,
 	escapeHtml
 } from './core.js';
-export type { AccountUser } from './core.js';
+export type { AccountUser, SessionCookieAttrs, ResolvedSessionCookieAttrs } from './core.js';
 
 export {
 	GOOGLE_CERTS_URL,
@@ -53,8 +54,8 @@ export {
 } from './google.js';
 export type { GoogleJwk, GoogleJwks, GoogleIdTokenResult, VerifyGoogleIdTokenOptions } from './google.js';
 
-export { buildSignInEmail } from './email.js';
-export type { SignInEmailParams, SignInEmail } from './email.js';
+export { buildSignInEmail, resolveEmailCopy, ttlText, DEFAULT_EMAIL_COPY } from './email.js';
+export type { SignInEmailParams, SignInEmail, EmailCopy } from './email.js';
 
 export { createD1Store, rateLimit } from './store.js';
 export type { AuthStore, MagicTokenRow, SessionInsert, RateRow, D1Like } from './store.js';
@@ -78,6 +79,7 @@ export type {
 	VerifyMagicTokenResult,
 	VerifyCodeServiceResult,
 	GoogleSignInResult,
+	AuthEvent,
 	RequestMagicLinkInput,
 	VerifyCodeInput,
 	GoogleSignInInput
